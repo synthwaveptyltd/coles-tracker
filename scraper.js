@@ -1,117 +1,82 @@
 /**
- * Coles Price Scraper
- * Fetches current prices for ALL products registered in Supabase
- * Runs daily after the catalog crawl has registered products
+ * Coles Price Scraper — API Version
+ * Updates prices for all tracked products using Coles JSON API
  */
 
-const { chromium } = require("playwright");
+const fetch = require("node-fetch");
 const { createClient } = require("@supabase/supabase-js");
 
 function getSupabase() {
   return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 }
 
-async function extractPrice(page) {
-  return await page.evaluate(() => {
-    const selectors = [
-      '[data-testid="product-pricing"] [class*="price__value"]',
-      '[class*="price__value"]',
-      '[class*="ProductPrice"] [class*="value"]',
-      '[class*="price-"] span',
-    ];
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const raw = el.textContent.replace(/[^0-9.]/g, "");
-        const price = parseFloat(raw);
-        if (!isNaN(price) && price > 0) return price;
-      }
-    }
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "en-AU,en;q=0.9",
+  "Origin": "https://www.coles.com.au",
+  "Referer": "https://www.coles.com.au/",
+};
+
+// Fetch price for a single product via API
+async function fetchProductPrice(productId) {
+  const url = `https://www.coles.com.au/api/2.0.0/product/${productId}`;
+  try {
+    const res = await fetch(url, { headers: HEADERS, timeout: 10000 });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = data?.pricing?.now ||
+                  data?.price?.now ||
+                  data?.nowPrice ||
+                  data?.price;
+    return price ? parseFloat(price) : null;
+  } catch {
     return null;
-  });
+  }
 }
 
 async function scrapeAllProducts() {
   const supabase = getSupabase();
+  const today = new Date().toISOString().split("T")[0];
 
-  // Load all products from Supabase
   const { data: products, error } = await supabase
     .from("products")
-    .select("id, name, url")
-    .not("url", "is", null);
+    .select("id, name")
+    .not("id", "is", null);
 
   if (error) throw error;
   if (!products?.length) {
-    console.log("[Scraper] No products found. Run catalog crawl first.");
+    console.log("[Scraper] No products. Run catalog crawl first.");
     return [];
   }
 
-  console.log(`[Scraper] Scraping prices for ${products.length} products...`);
+  console.log(`[Scraper] Updating prices for ${products.length} products...`);
+  let success = 0, failed = 0;
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-
-  const today = new Date().toISOString().split("T")[0];
-  const results = [];
-  let successCount = 0;
-  let failCount = 0;
-
-  // Process in batches of 5 (parallel pages)
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < products.length; i += BATCH_SIZE) {
-    const batch = products.slice(i, i + BATCH_SIZE);
-
+  // Process in batches of 10
+  for (let i = 0; i < products.length; i += 10) {
+    const batch = products.slice(i, i + 10);
     await Promise.all(batch.map(async (product) => {
-      const page = await browser.newPage();
-      try {
-        await page.setExtraHTTPHeaders({
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        });
-
-        await page.goto(product.url, { waitUntil: "domcontentloaded", timeout: 25000 });
-        await page.waitForTimeout(1500);
-
-        const price = await extractPrice(page);
-
-        if (price != null) {
-          // Update current price in products table
-          await supabase.from("products").update({
-            current_price: price,
-            last_updated: new Date().toISOString(),
-          }).eq("id", product.id);
-
-          // Insert into price_history
-          await supabase.from("price_history").upsert(
-            { product_id: product.id, price, recorded_at: today },
-            { onConflict: "product_id,recorded_at" }
-          );
-
-          successCount++;
-          results.push({ id: product.id, price, ok: true });
-          if (successCount % 50 === 0) {
-            console.log(`[Scraper] Progress: ${successCount} prices recorded...`);
-          }
-        } else {
-          failCount++;
-          results.push({ id: product.id, ok: false, error: "No price found" });
-        }
-      } catch (err) {
-        failCount++;
-        results.push({ id: product.id, ok: false, error: err.message });
-      } finally {
-        await page.close();
+      const price = await fetchProductPrice(product.id);
+      if (price != null) {
+        await supabase.from("products")
+          .update({ current_price: price, last_updated: new Date().toISOString() })
+          .eq("id", product.id);
+        await supabase.from("price_history")
+          .upsert({ product_id: product.id, price, recorded_at: today },
+            { onConflict: "product_id,recorded_at" });
+        success++;
+      } else {
+        failed++;
       }
     }));
 
-    // Pause between batches
-    await new Promise((r) => setTimeout(r, 2000));
+    if (i % 100 === 0) console.log(`[Scraper] Progress: ${i}/${products.length}`);
+    await new Promise((r) => setTimeout(r, 200));
   }
 
-  await browser.close();
-  console.log(`[Scraper] Complete! ✓ ${successCount} prices recorded, ✗ ${failCount} failed`);
-  return results;
+  console.log(`[Scraper] Done! ✓ ${success} updated, ✗ ${failed} failed`);
+  return { success, failed };
 }
 
 module.exports = { scrapeAllProducts };
