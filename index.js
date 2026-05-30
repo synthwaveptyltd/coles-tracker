@@ -75,6 +75,26 @@ app.get("/status", async (req, res) => {
   }
 });
 
+// ── Browser-friendly trigger page ─────────────────────────
+app.get("/trigger", (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== process.env.SCRAPE_SECRET) {
+    return res.send("Wrong secret. Use /trigger?secret=YOUR_SECRET");
+  }
+  res.send("Crawl started! Check /status in 30 minutes.");
+  crawlCatalog().catch(console.error);
+});
+
+// ── Browser-friendly price scrape trigger ─────────────────
+app.get("/trigger-scrape", (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== process.env.SCRAPE_SECRET) {
+    return res.send("Wrong secret.");
+  }
+  res.send("Price scrape started! Check /status in 30 minutes.");
+  scrapeAllProducts().catch(console.error);
+});
+
 // ── Manual triggers (protected) ───────────────────────────
 function checkSecret(req, res) {
   if (req.headers["x-scrape-secret"] !== process.env.SCRAPE_SECRET) {
@@ -133,4 +153,3 @@ app.listen(PORT, () => {
   console.log(`[Server] Catalog crawl: 6 AM AEST daily`);
   console.log(`[Server] Price scrape:  8 AM AEST daily`);
 });
-
