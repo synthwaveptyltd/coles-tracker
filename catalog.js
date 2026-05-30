@@ -1,7 +1,7 @@
 /**
- * Coles Catalog Crawler — API Version
- * Uses Coles's own JSON API directly — no browser, no Playwright.
- * Fast, lightweight, works on free hosting tier.
+ * Coles Catalog Crawler v5
+ * Uses the correct Coles _next/data API endpoints
+ * First fetches the build ID, then uses it for all category requests
  */
 
 const fetch = require("node-fetch");
@@ -11,16 +11,14 @@ function getSupabase() {
   return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 }
 
-// Coles API headers — mimics a real browser request
 const HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "Accept": "application/json, text/plain, */*",
   "Accept-Language": "en-AU,en;q=0.9",
-  "Origin": "https://www.coles.com.au",
   "Referer": "https://www.coles.com.au/",
+  "Cookie": "fulfillmentStoreId=0357; shopping-method=delivery",
 };
 
-// All Coles categories with their API slugs
 const CATEGORIES = [
   "fruit-vegetables",
   "meat-seafood-deli",
@@ -37,138 +35,179 @@ const CATEGORIES = [
   "personal-care",
 ];
 
-// Fetch one page of products from Coles API
-async function fetchCategoryPage(category, page = 1) {
-  const url = `https://www.coles.com.au/api/2.0.0/page/categories/${category}?pageSize=48&page=${page}`;
+// Step 1: Get the Next.js build ID from the Coles homepage
+async function getBuildId() {
   try {
-    const res = await fetch(url, { headers: HEADERS, timeout: 15000 });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    return json;
+    console.log("[Catalog] Fetching Coles build ID...");
+    const res = await fetch("https://www.coles.com.au/", {
+      headers: HEADERS,
+      timeout: 15000,
+    });
+    const html = await res.text();
+
+    // Extract build ID from __NEXT_DATA__ script tag
+    const match = html.match(/"buildId"\s*:\s*"([^"]+)"/);
+    if (match) {
+      console.log(`[Catalog] Build ID: ${match[1]}`);
+      return match[1];
+    }
+
+    // Alternative: look in _next/static path references
+    const match2 = html.match(/_next\/static\/([a-zA-Z0-9_-]+)\//);
+    if (match2) {
+      console.log(`[Catalog] Build ID (alt): ${match2[1]}`);
+      return match2[1];
+    }
+
+    throw new Error("Could not find build ID");
   } catch (err) {
-    console.error(`[API] Failed to fetch ${category} page ${page}:`, err.message);
+    console.error("[Catalog] Failed to get build ID:", err.message);
     return null;
   }
 }
 
-// Extract products from API response
-function extractProducts(data, category) {
-  const products = [];
-  const catalogEntries = data?.pageProps?.searchResults?.results || 
-                         data?.results || 
-                         data?.catalogEntries || 
-                         [];
-
-  for (const item of catalogEntries) {
-    try {
-      const id = item.id || item.stockcode || item._id;
-      const name = item.name || item.description || item.brand;
-      const price = item.pricing?.now || 
-                    item.price?.now || 
-                    item.nowPrice || 
-                    item.price;
-      const imageUrl = item.imageUris?.[0]?.uri || 
-                       item.images?.[0]?.url || 
-                       item.image;
-      const url = `https://www.coles.com.au/product/${item.slug || id}`;
-
-      if (id && name) {
-        products.push({
-          id: String(id),
-          name: String(name).trim(),
-          category,
-          current_price: price ? parseFloat(price) : null,
-          image_url: imageUrl || null,
-          url,
-          last_updated: new Date().toISOString(),
-        });
-      }
-    } catch (e) {
-      // skip malformed entries
+// Step 2: Fetch products for a category page using the build ID
+async function fetchCategoryPage(buildId, category, page = 1) {
+  const url = `https://www.coles.com.au/_next/data/${buildId}/en/browse/${category}.json?page=${page}&slug=${category}`;
+  try {
+    const res = await fetch(url, { headers: HEADERS, timeout: 15000 });
+    if (!res.ok) {
+      console.error(`[API] ${category} page ${page}: HTTP ${res.status}`);
+      return null;
     }
+    const json = await res.json();
+    return json;
+  } catch (err) {
+    console.error(`[API] ${category} page ${page}:`, err.message);
+    return null;
   }
-  return products;
 }
 
-// Save products to Supabase in batches
+// Extract product list from Next.js page data
+function extractProducts(data, category) {
+  const products = [];
+
+  // Navigate the Next.js data structure
+  const pageProps = data?.pageProps;
+  const searchResults = pageProps?.searchResults ||
+                        pageProps?.initialData?.results ||
+                        pageProps?.results;
+
+  const results = searchResults?.results ||
+                  searchResults?.catalogEntries ||
+                  searchResults?.products ||
+                  [];
+
+  const totalCount = searchResults?.noOfResults ||
+                     searchResults?.totalCount || 0;
+
+  for (const item of results) {
+    try {
+      const id = String(item.id || item.stockcode || item._id || "").trim();
+      const name = (item.name || item.description || "").trim();
+      if (!id || !name) continue;
+
+      const pricing = item.pricing || item.price || {};
+      const price = pricing.now ?? pricing.current ?? item.nowPrice ?? item.price;
+
+      const slug = item.slug || item.seoToken || id;
+      const url = `https://www.coles.com.au/product/${slug}`;
+
+      const imageUrl = item.imageUris?.[0]?.uri ||
+                       item.images?.[0]?.url ||
+                       item.imageUrl || null;
+
+      products.push({
+        id,
+        name,
+        category,
+        current_price: price ? parseFloat(price) : null,
+        image_url: imageUrl,
+        url,
+        last_updated: new Date().toISOString(),
+      });
+    } catch (e) {
+      // skip bad entries
+    }
+  }
+
+  return { products, totalCount };
+}
+
+// Save batch of products to Supabase
 async function saveProducts(supabase, products) {
   if (!products.length) return;
   const today = new Date().toISOString().split("T")[0];
 
-  // Upsert products
   for (let i = 0; i < products.length; i += 100) {
     const batch = products.slice(i, i + 100);
-    const { error } = await supabase
-      .from("products")
+    const { error } = await supabase.from("products")
       .upsert(batch, { onConflict: "id" });
-    if (error) console.error("[Supabase] Product upsert error:", error.message);
+    if (error) console.error("[Supabase] Upsert error:", error.message);
   }
 
-  // Save price history
   const historyRows = products
     .filter((p) => p.current_price != null)
-    .map((p) => ({
-      product_id: p.id,
-      price: p.current_price,
-      recorded_at: today,
-    }));
+    .map((p) => ({ product_id: p.id, price: p.current_price, recorded_at: today }));
 
   for (let i = 0; i < historyRows.length; i += 100) {
     const batch = historyRows.slice(i, i + 100);
-    const { error } = await supabase
-      .from("price_history")
+    const { error } = await supabase.from("price_history")
       .upsert(batch, { onConflict: "product_id,recorded_at" });
-    if (error) console.error("[Supabase] History upsert error:", error.message);
+    if (error) console.error("[Supabase] History error:", error.message);
   }
 
-  console.log(`[Supabase] Saved ${products.length} products, ${historyRows.length} price records`);
+  console.log(`[Supabase] ✓ Saved ${products.length} products, ${historyRows.length} prices`);
 }
 
-// Crawl all categories
+// Main catalog crawl
 async function crawlCatalog() {
-  console.log("[Catalog] Starting API-based catalog crawl...");
+  console.log("[Catalog] Starting Coles catalog crawl v5...");
   const supabase = getSupabase();
+
+  // Get the current build ID first
+  const buildId = await getBuildId();
+  if (!buildId) {
+    console.error("[Catalog] Cannot proceed without build ID");
+    return 0;
+  }
+
   let totalProducts = 0;
 
   for (const category of CATEGORIES) {
-    console.log(`[Catalog] Crawling: ${category}`);
+    console.log(`[Catalog] Category: ${category}`);
     let page = 1;
     let categoryTotal = 0;
-    const MAX_PAGES = 15;
+    let totalCount = Infinity;
+    const PAGE_SIZE = 48;
 
-    while (page <= MAX_PAGES) {
-      const data = await fetchCategoryPage(category, page);
+    while (categoryTotal < totalCount && page <= 20) {
+      const data = await fetchCategoryPage(buildId, category, page);
       if (!data) break;
 
-      const products = extractProducts(data, category);
+      const { products, totalCount: tc } = extractProducts(data, category);
+      if (tc > 0) totalCount = tc;
+
       if (!products.length) {
-        console.log(`[Catalog] ${category} — no more products at page ${page}`);
+        console.log(`[Catalog] ${category} — no products on page ${page}`);
         break;
       }
 
       await saveProducts(supabase, products);
       categoryTotal += products.length;
-      console.log(`[Catalog] ${category} page ${page}: ${products.length} products`);
+      console.log(`[Catalog] ${category} p${page}: ${products.length} products (${categoryTotal}/${totalCount})`);
 
-      // Check if there are more pages
-      const totalCount = data?.pageProps?.searchResults?.noOfResults ||
-                         data?.noOfResults ||
-                         data?.totalCount || 0;
-      if (categoryTotal >= totalCount || products.length < 48) break;
-
+      if (products.length < PAGE_SIZE) break;
       page++;
-      // Small delay between pages
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 600));
     }
 
     totalProducts += categoryTotal;
-    console.log(`[Catalog] ${category} done: ${categoryTotal} products`);
-
-    // Delay between categories
+    console.log(`[Catalog] ${category} complete: ${categoryTotal} products`);
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  console.log(`[Catalog] Complete! Total: ${totalProducts} products`);
+  console.log(`[Catalog] ALL DONE! Total products: ${totalProducts}`);
   return totalProducts;
 }
 
