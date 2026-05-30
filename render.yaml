@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: coles-price-tracker
+    env: node
+    region: singapore   # closest to Australia
+    plan: free
+    buildCommand: npm install && npx playwright install chromium --with-deps
+    startCommand: npm start
+    envVars:
+      - key: SUPABASE_URL
+        sync: false       # fill in Render dashboard
+      - key: SUPABASE_KEY
+        sync: false       # fill in Render dashboard
+      - key: SCRAPE_SECRET
+        generateValue: true   # Render auto-generates a secure random value
