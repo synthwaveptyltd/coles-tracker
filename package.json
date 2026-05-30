@@ -1,17 +1,16 @@
 {
-  "name": "coles-price-scraper",
-  "version": "1.0.0",
-  "description": "Daily Coles price scraper — runs on Render.com free tier",
+  "name": "coles-price-tracker",
+  "version": "4.0.0",
+  "description": "Coles price tracker using direct API — no browser needed",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "scrape": "node scraper.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
     "express": "^4.18.2",
     "node-cron": "^3.0.3",
-    "playwright": "^1.40.0"
+    "node-fetch": "^2.7.0"
   },
   "engines": {
     "node": ">=18"
